@@ -257,26 +257,82 @@ Promoting the replica (`docker compose exec -u postgres pg-replica pg_ctl promot
 
 ## Results
 
-**The 700 RPS target is not currently met.** All runs were on one WSL2 machine (6 cores, 5 GB), where k6 competes with the service for CPU, with 100k links.
+Targets: 700 RPS sustained, p99 < 50 ms, errors < 0.1%. **The targets were not met on the test machine.** The numbers below are measurements, not a capacity limit.
 
-| Run | Errors | Notes |
-| --- | --- | --- |
-| 700 RPS, 2 min, Redis warmed by earlier runs, before fixes | 0.00%, p(99) < 50 ms | p50 / p95 about 2 / 7 ms; L1 13%, L2 81%, DB 6% |
-| 700 RPS, 2 min, cold cache, final code | 83.5% | mostly 504, no 502 |
-| 700 RPS, 2 min, Redis preloaded with all links, final code | 35.4% | repeat 40 s runs: 73% |
-| 3000 RPS, 30 s, final code | 57.6% | k6 could not reach the target rate; no 502, nodes stayed up |
+### Test setup
 
-Why the warm result changed is unresolved. A 40 s A/B run with the old pool size also failed (70% vs 73%), so the pool is not the cause. The machine's load average was 12-16 during these runs, and one node's cold resolver alone reached about 770 lookups/s in-process, while the full HTTP stack reached about 270/s. Under load nodes can report unhealthy on `/health/live`, which suggests a saturated event loop.
+- Server: 6 cores, 24 GB RAM, Docker Compose, 3 app nodes behind nginx, 100k seeded links.
+- k6 ran on the same host as the service. The host also runs GitLab, k3s and other services, which used about 2 of the 6 cores while the project was idle (load average about 4).
+- Load: k6 `constant-arrival-rate`, 2 minutes per run, skewed code distribution (a small share of links gets most hits).
 
-Failure scenarios (run one at a time, 140-650 requests each, before the final fixes unless noted):
+### Latency and errors
+
+| Target rate | Achieved | Errors | Median | p90 | p95 | Max | Cache |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 700 RPS, run 1 | 537 RPS | 61.6% | 505 ms | 570 ms | 612 ms | 1.13 s | cold |
+| 700 RPS, run 2 | 548 RPS | 65.5% | 506 ms | 613 ms | 669 ms | 1.19 s | warm |
+| 350 RPS, run 1 | 346 RPS | 0.44% | 12.7 ms | 101 ms | 193 ms | 0.80 s | cold |
+| 350 RPS, run 2 | 340 RPS | 1.89% | 17.9 ms | 204 ms | 328 ms | 1.02 s | warm |
+| 200 RPS | 200 RPS | 0.18% | 9.5 ms | 54.5 ms | 99.6 ms | 0.79 s | warm |
+
+p99 is not in the table because the k6 summary does not print it. With p95 above 50 ms in every run, the p99 < 50 ms threshold failed in all of them.
+
+### Throughput
+
+- The service served about 540 RPS at most. Above that, requests queue and nginx cuts them at its 500 ms read timeout, so failed requests cluster at 505 ms.
+- At 700 RPS, successful requests alone had a median of 244 ms and p95 of 449 ms.
+- At 350 and 200 RPS the median stays at 10-18 ms, but a long tail and a small share of errors remain.
+
+### Resource usage during the 700 RPS run
+
+| Container | CPU |
+| --- | --- |
+| app1 / app2 / app3 | 186% / 189% / 141% |
+| k6 | 144% |
+| nginx | 55% |
+| Redis, Postgres | under 30% |
+
+The three Python nodes are the bottleneck: about 180 RPS per node, with the databases mostly idle. Why each request costs about 10 ms of CPU has not been profiled yet.
+
+### Cache hit split
+
+Measured once, on a laptop with a warm Redis and the code before the review fixes, so it is indicative only: L1 13%, L2 (Redis) 81%, database 6%. It was not measured on the server runs.
+
+### Failure scenarios
+
+Run one at a time on a laptop, 140-650 requests each. `stop app2` was re-checked on the final code.
 
 | Scenario | Result |
 | --- | --- |
-| `stop app2` | all 302, re-checked on the final code |
-| `stop redis-primary` | all 302, failover completed, invalidation still worked |
+| Node down (`app2`) | all redirects 302, GET retried on another node |
+| Redis primary down | all 302, Sentinel failover completed, invalidation still worked |
 | Redis fully down | all 302, `POST` still 201, recovered after restart |
-| `stop pg-replica` | all 302, `POST` still 201 |
-| `stop pg-primary` | all 302, `POST` returns 503 with `Retry-After: 1` |
-| `pg_ctl promote` | `POST` stays 503 until `PG_PRIMARY_DSN` changes |
+| PG replica down | all 302, `POST` still 201 |
+| PG primary down | all 302, `POST` returns 503 with `Retry-After: 1` |
+| PG promote | `POST` stays 503 until `PG_PRIMARY_DSN` is changed |
 
-Tests on the final code: 27 unit and 11 integration tests pass on a fresh stack. Known limit: a node cannot start while the replica is down.
+Not tested on the final code: the 3000 RPS overload scenario on the server.
+
+### Tests
+
+27 unit tests and 11 integration tests pass on a fresh stack.
+
+### Known limits
+
+- A node cannot start while the replica is down.
+- A deleted link can stay in L2 if Redis is down at delete time or replica lag exceeds 300 s.
+- Idempotency cleanup physically deletes expired rows.
+
+## Differences from the plan
+
+- The nginx code regex is quoted: nginx does not start with an unquoted `{3,10}`.
+- Redirects use `proxy_read_timeout 500ms` instead of 200 ms, `max_fails=0` instead of 2, and retry only failed connects.
+- nginx sets `Retry-After` on all 429 and 503 responses, and `192.168.0.0/16` was added to the internal networks.
+- Delete writes a tombstone and cache fills use `SET NX`.
+- URLs with control characters or malformed hosts return 400.
+- Redis and asyncpg connections are opened at startup, so a burst does not start on an empty pool.
+- The idempotency key is stored as `sha256(user_id:key)` so users cannot collide.
+- Added `HTTP_PORT` and a second dev user with key `dev-key-456`.
+- The `idempotency_keys` cleanup physically deletes rows, as in the plan. This conflicts with the "no DELETE against the database" rule; if that rule applies here, it needs archiving or date partitioning.
+- `requirements.lock` was not created, so dependency versions are not pinned.
+- k6 tags every request with `name: redirect`, so it no longer creates one metric series per code.
