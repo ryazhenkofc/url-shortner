@@ -1,0 +1,124 @@
+name: url-shortener
+
+x-app: &app
+  build: .
+  restart: unless-stopped
+  depends_on:
+    pg-primary:     { condition: service_healthy }
+    pg-replica:     { condition: service_healthy }
+    redis-sentinel: { condition: service_started }
+
+x-app-env: &app-env
+  BASE_URL: ${BASE_URL:-http://localhost:8080}
+  PG_PRIMARY_DSN: postgresql://shortener:${PG_PASSWORD:-shortener}@pg-primary:5432/shortener
+  PG_REPLICA_DSN: postgresql://shortener:${PG_PASSWORD:-shortener}@pg-replica:5432/shortener
+  REDIS_SENTINELS: redis-sentinel:26379
+  REDIS_MASTER_NAME: mymaster
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["${HTTP_PORT:-8080}:80"]
+    volumes: ["./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [app1, app2, app3]
+
+  app1: { <<: *app, environment: { <<: *app-env, NODE_ID: app1 } }
+  app2: { <<: *app, environment: { <<: *app-env, NODE_ID: app2 } }
+  app3: { <<: *app, environment: { <<: *app-env, NODE_ID: app3 } }
+
+  pg-primary:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-shortener}
+      POSTGRES_DB: shortener
+      REPL_PASSWORD: ${REPL_PASSWORD:-replicator}
+    volumes:
+      - pg-primary:/var/lib/postgresql/data
+      - ./deploy/postgres/00-replication.sh:/docker-entrypoint-initdb.d/00-replication.sh:ro
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports: ["5432:5432"]                     # for debugging, can be removed
+    healthcheck:
+      # -h 127.0.0.1 forces TCP: the unix socket answers on initdb's temporary server too
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shortener -d shortener"]
+      interval: 3s
+      retries: 30
+
+  pg-replica:
+    image: postgres:17
+    user: postgres
+    environment:
+      PGPASSWORD: ${REPL_PASSWORD:-replicator}
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        if [ ! -s "$$PGDATA/PG_VERSION" ]; then
+          until pg_basebackup -h pg-primary -U replicator -D "$$PGDATA" -X stream -R; do
+            echo "waiting for primary..."; rm -rf "$$PGDATA"/*; sleep 2
+          done
+          chmod 700 "$$PGDATA"
+        fi
+        exec postgres
+    volumes: ["pg-replica:/var/lib/postgresql/data"]
+    depends_on:
+      pg-primary: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U shortener -d shortener"]
+      interval: 3s
+      retries: 30
+
+  redis-primary:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lfu",
+              "--save", "", "--appendonly", "no"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 3s, retries: 20 }
+
+  redis-replica:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--replicaof", "redis-primary", "6379",
+              "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lfu"]
+    depends_on:
+      redis-primary: { condition: service_healthy }
+
+  redis-sentinel:
+    image: redis:7.4-alpine
+    command:
+      - sh
+      - -c
+      - |
+        cat > /tmp/sentinel.conf <<EOF
+        port 26379
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor mymaster redis-primary 6379 1
+        sentinel down-after-milliseconds mymaster 5000
+        sentinel failover-timeout mymaster 10000
+        EOF
+        exec redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      redis-primary: { condition: service_healthy }
+      redis-replica: { condition: service_started }
+
+  # --- observability profile: docker compose --profile obs up ---
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["obs"]
+    volumes: ["./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["obs"]
+    ports: ["3000:3000"]
+
+  # --- load profile: docker compose --profile load run --rm k6 ---
+  k6:
+    image: grafana/k6:0.52.0
+    profiles: ["load"]
+    volumes: ["./load:/load:ro"]
+    environment: { BASE: http://nginx }
+    command: ["run", "/load/redirect.js"]
+
+volumes:
+  pg-primary:
+  pg-replica:
